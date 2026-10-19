@@ -12,17 +12,23 @@ Measurement layers:
   Default (UMD pool): torch caching allocator; pool reuse/merge is UMD behavior,
     only cold paths reach KMD.
   --direct: one KMD alloc per call. cuda/hip: ctypes cudaMalloc/hipMalloc; xpu:
-    Level Zero zeMemAllocDevice (libze_loader.so.1). Tests 2/3 need the direct API
-    to build KMD-level fragmentation; without it they fall back to UMD pool semantics.
+    Level Zero zeMemAllocDevice (libze_loader.so.1). The fragmentation tests need
+    the direct API to build KMD-level fragmentation; without it they fall back to
+    UMD pool semantics.
   --ze-uncached (xpu): adds BIAS_UNCACHED to the alloc flags (GPU UC caching policy
     for cache A/B, not a pool bypass).
+  --contig (xpu): KMD allocs via zePhysicalMemCreate + zeVirtualMemMap -- one physical
+    object per alloc (contiguous physical backing, no page scatter), the
+    fragmentation-sensitive mode: scattered free space can no longer serve large
+    requests. cuda/hip need no flag (cudaMalloc/hipMalloc are contiguous-demanding).
 
 Usage / A-B (comparison is manual; the script never auto-compares):
   python mem_perf.py --backend xpu
   python mem_perf.py --backend cuda --direct --json direct.json
+  python mem_perf.py --backend xpu --direct --contig --ratio 1.0
   Diff the JSON reports across allocator/driver configs. Random sequences come from
   the --seed PRNG stream; the plan (fill sizes / freed indices) is recorded in JSON
-  (test3.plan_fill_sizes / plan_freed_indices) for audit.
+  (severe_frag.plan_fill_sizes / plan_freed_indices) for audit.
 
 Allocator config must be set before python starts:
   cuda: PYTORCH_CUDA_ALLOC_CONF; uncached bypass: PYTORCH_NO_CUDA_MEMORY_CACHING=1
@@ -30,10 +36,11 @@ Allocator config must be set before python starts:
   xpu:  torch 2.8.0+xpu XPUCachingAllocator parses no allocator config (verified);
         true direct alloc exists via Level Zero ctypes (--direct).
 
-Memory pressure: with ample device memory, UMD pool fragmentation does not OOM (KMD
-  supplies new segments); it only grows reserved. To observe fragmentation OOM, push
-  --max-gb/--ratio toward device free memory. A larger --bench-mb (e.g. 32) amplifies
-  pool split/search overhead.
+Memory pressure: --ratio scales the test budget against driver free memory; --ratio 1.0
+  fills ALL free memory for the fragmentation tests (no large contiguous region left).
+  With ample device memory, UMD pool fragmentation does not OOM (KMD supplies new
+  segments); it only grows reserved. A larger --bench-mb (e.g. 32) amplifies pool
+  split/search overhead.
 """
 
 import argparse
@@ -54,8 +61,9 @@ except ImportError:
 
 MB = 1024**2
 GB = 1024**2 * 1024
-LADDER_MB = [16, 32, 64, 128, 256, 512, 1024, 2048]     # test 3 growing ladder
-FILL_SIZES_MB = [8, 16, 24, 32, 48, 64, 96]             # test 3 random fill sizes
+LADDER_MB = [16, 32, 64, 128, 256, 512, 1024, 2048]     # frag ladder (growing contiguous allocs)
+FILL_SIZES_MB = [8, 16, 24, 32, 48, 64, 96]             # frag random fill sizes
+SIZES_MB = [4, 32, 128, 512]                            # baseline block sizes
 ENV_KEYS = (
     "PYTORCH_ALLOC_CONF",
     "PYTORCH_CUDA_ALLOC_CONF",
@@ -142,6 +150,9 @@ class LevelZeroDriver:
     ZE_STYPE_CONTEXT_DESC = 0xD
     ZE_STYPE_DEVICE_MEM_ALLOC_DESC = 0x15
     ZE_STYPE_DEVICE_PROPERTIES = 0x3
+    ZE_STYPE_PHYSICAL_MEM_DESC = 0x20
+    ZE_PHYSICAL_MEM_FLAG_ALLOCATE_ON_DEVICE = 0x1
+    ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE = 1
     ZE_DEVICE_TYPE_GPU = 1
 
     class _ContextDesc(ctypes.Structure):
@@ -155,6 +166,14 @@ class LevelZeroDriver:
             ("ordinal", ctypes.c_uint32),
         ]
 
+    class _PhysicalMemDesc(ctypes.Structure):
+        _fields_ = [
+            ("stype", ctypes.c_int32),
+            ("pNext", ctypes.c_void_p),
+            ("flags", ctypes.c_uint32),
+            ("size", ctypes.c_size_t),
+        ]
+
     class _DeviceProps(ctypes.Structure):
         # only "type" is read; anonymous buffer pads the tail beyond full struct size
         _fields_ = [
@@ -166,7 +185,7 @@ class LevelZeroDriver:
             ("_pad", ctypes.c_uint8 * 1024),
         ]
 
-    def __init__(self):
+    def __init__(self, contig: bool = False):
         lib = None
         for cand in ("libze_loader.so.1", "libze_loader.so"):
             try:
@@ -195,6 +214,22 @@ class LevelZeroDriver:
         lib.zeMemFree.restype = ctypes.c_int
         lib.zeDeviceSynchronize.argtypes = [ctypes.c_void_p]
         lib.zeDeviceSynchronize.restype = ctypes.c_int
+        if contig:
+            for fn in (
+                "zeVirtualMemQueryPageSize", "zeVirtualMemReserve", "zeVirtualMemMap",
+                "zeVirtualMemUnmap", "zeVirtualMemFree", "zePhysicalMemCreate", "zePhysicalMemDestroy",
+            ):
+                if not hasattr(lib, fn):
+                    raise OSError(f"L0 loader lacks {fn} (loader too old for the physical-memory mode)")
+                getattr(lib, fn).restype = ctypes.c_int
+            lib.zeVirtualMemQueryPageSize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+            lib.zeVirtualMemReserve.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+            lib.zeVirtualMemMap.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            lib.zeVirtualMemUnmap.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            lib.zeVirtualMemFree.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            lib.zePhysicalMemCreate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(self._PhysicalMemDesc), ctypes.POINTER(ctypes.c_void_p)]
+            lib.zePhysicalMemDestroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.contig = contig
         self._lib = lib
 
         self._check(lib.zeInit(self.ZE_INIT_FLAG_GPU_ONLY), "zeInit")
@@ -230,6 +265,8 @@ class LevelZeroDriver:
         self.context = ctypes.c_void_p()
         self._check(lib.zeContextCreate(self._driver, ctypes.byref(cdesc), ctypes.byref(self.context)), "zeContextCreate")
         self.desc = f"zeMemAllocDevice(Level Zero, flags=0x{ZE_ALLOC_FLAGS:x})"
+        if contig:
+            self.desc = "zePhysicalMemCreate+zeVirtualMemMap(Level Zero, physically contiguous)"
         # self-check: 1MB alloc/free
         self.free(self.alloc(MB))
 
@@ -237,7 +274,14 @@ class LevelZeroDriver:
         if rc != self.ZE_SUCCESS:
             raise OSError(f"{what} failed rc=0x{rc & 0xFFFFFFFF:x}")
 
+    def _oom_or_raise(self, rc: int, what: str):
+        if rc in (self.ZE_OOM_DEVICE, self.ZE_OOM_HOST):
+            raise RawOOM(f"{self.desc}: KMD out of memory ({what}, rc=0x{rc & 0xFFFFFFFF:x})")
+        self._check(rc, what)
+
     def alloc(self, nbytes: int) -> int:
+        if self.contig:
+            return self._alloc_phys(nbytes)
         desc = self._MemAllocDesc()
         desc.stype = self.ZE_STYPE_DEVICE_MEM_ALLOC_DESC
         desc.flags = ZE_ALLOC_FLAGS
@@ -253,6 +297,9 @@ class LevelZeroDriver:
         return ptr.value
 
     def free(self, ptr: int):
+        if self.contig:
+            self._free_phys(ptr)
+            return
         rc = self._lib.zeMemFree(self.context, ctypes.c_void_p(ptr))
         if rc != self.ZE_SUCCESS:
             print(f"  ⚠️ {self.desc} free rc=0x{rc & 0xFFFFFFFF:x}")
@@ -262,6 +309,43 @@ class LevelZeroDriver:
         if rc != self.ZE_SUCCESS:
             print(f"  ⚠️ {self.desc} sync rc=0x{rc & 0xFFFFFFFF:x}")
 
+    def _alloc_phys(self, nbytes: int):
+        """Physically contiguous KMD alloc: one zePhysicalMemCreate object (single
+        contiguous physical backing, no page scatter) mapped into a reserved VA range."""
+        ctx, dev = self.context, self.device
+        ps = ctypes.c_size_t(0)
+        rc = self._lib.zeVirtualMemQueryPageSize(ctx, dev, nbytes, ctypes.byref(ps))
+        self._check(rc, "zeVirtualMemQueryPageSize")
+        vsize = ((nbytes + ps.value - 1) // ps.value) * ps.value
+        va = ctypes.c_void_p()
+        rc = self._lib.zeVirtualMemReserve(ctx, None, vsize, ctypes.byref(va))
+        if rc != self.ZE_SUCCESS:
+            self._oom_or_raise(rc, "zeVirtualMemReserve")
+        pdesc = self._PhysicalMemDesc()
+        pdesc.stype = self.ZE_STYPE_PHYSICAL_MEM_DESC
+        pdesc.flags = self.ZE_PHYSICAL_MEM_FLAG_ALLOCATE_ON_DEVICE
+        pdesc.size = vsize
+        phys = ctypes.c_void_p()
+        rc = self._lib.zePhysicalMemCreate(ctx, dev, ctypes.byref(pdesc), ctypes.byref(phys))
+        if rc != self.ZE_SUCCESS:
+            self._lib.zeVirtualMemFree(ctx, va, vsize)
+            self._oom_or_raise(rc, "zePhysicalMemCreate")
+        rc = self._lib.zeVirtualMemMap(ctx, va, vsize, phys, 0, self.ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE)
+        if rc != self.ZE_SUCCESS:
+            self._lib.zePhysicalMemDestroy(ctx, phys)
+            self._lib.zeVirtualMemFree(ctx, va, vsize)
+            self._oom_or_raise(rc, "zeVirtualMemMap")
+        return (phys.value, va.value, vsize)
+
+    def _free_phys(self, h):
+        phys, va, vsize = h
+        ctx = self.context
+        self._lib.zeVirtualMemUnmap(ctx, ctypes.c_void_p(va), vsize)
+        self._lib.zePhysicalMemDestroy(ctx, ctypes.c_void_p(phys))
+        rc = self._lib.zeVirtualMemFree(ctx, ctypes.c_void_p(va), vsize)
+        if rc != self.ZE_SUCCESS:
+            print(f"  ⚠️ {self.desc} free rc=0x{rc & 0xFFFFFFFF:x}")
+
 
 # ========= Backend abstraction =========
 class Backend:
@@ -270,21 +354,24 @@ class Backend:
     _mod = None
 
     def __init__(self):
-        self.raw = None  # raw driver allocator or None
+        self.raw = None      # raw driver allocator or None
+        self.raw_err = None  # why raw is unavailable (shown on --direct degrade)
 
     def available(self) -> bool:
         raise NotImplementedError
 
-    def _try_raw(self):
+    def _try_raw(self, contig: bool = False):
         return None
 
-    def setup(self, direct: bool):
+    def setup(self, direct: bool, contig: bool = False):
         if not direct:
             return
+        if contig and self.NAME != "xpu":
+            print(f"  ℹ️ {self.NAME}: --contig is a no-op ({self.NAME} allocs are already contiguous-demanding)")
         try:
-            self.raw = self._try_raw()
+            self.raw = self._try_raw(contig)
         except Exception as e:
-            print(f"  ℹ️ {self.NAME}: no direct driver API ({e}); --direct degrades to per-alloc empty_cache")
+            self.raw, self.raw_err = None, str(e)
 
     def device_name(self):
         try:
@@ -326,7 +413,7 @@ class CudaLikeBackend(Backend):
     def available(self):
         return self._is_hip == bool(getattr(torch.version, "hip", None)) and torch.cuda.is_available()
 
-    def _try_raw(self):
+    def _try_raw(self, contig: bool = False):
         return RawDriver("hip" if self._is_hip else "cuda")
 
 
@@ -350,8 +437,8 @@ class XpuBackend(Backend):
     def available(self):
         return torch.xpu.is_available()
 
-    def _try_raw(self):
-        return LevelZeroDriver()
+    def _try_raw(self, contig: bool = False):
+        return LevelZeroDriver(contig=contig)
 
 
 BACKENDS = {"cuda": CudaBackend, "hip": HipBackend, "xpu": XpuBackend}
@@ -374,40 +461,47 @@ def resolve_backend(name: str):
     return None
 
 
-# ========= Measurement layer / uniform handles =========
-class AllocStrategy:
-    def __init__(self, bk: Backend, direct: bool):
-        self.bk = bk
-        self.direct = direct
+# ========= Measurement layers: UMD pool vs KMD direct =========
+class PoolLayer:
+    """UMD layer: torch tensors through the caching allocator.
 
-    @property
-    def is_raw(self):
-        """True when every alloc lands in KMD (direct + working raw driver API)."""
-        return self.direct and self.bk.raw is not None
+    Gauge is reserved MB (counts up), sync is torch-side, fill is supported, and
+    tensors free when the caller drops the reference.
+    """
+
+    layer_name = "UMD pool"
+
+    def __init__(self, bk: Backend, degraded: bool = False):
+        self.bk = bk
+        self.label = (
+            "KMD direct (empty_cache through UMD pool)"
+            if degraded
+            else "UMD cached pool (torch caching allocator)"
+        )
 
     @property
     def name(self):
-        if not self.direct:
-            return "UMD cached pool (torch caching allocator)"
-        if self.is_raw:
-            return f"KMD direct ({self.bk.raw.desc})"
-        return "KMD direct (empty_cache through UMD pool)"
+        return self.label
 
-    @property
-    def layer_name(self):
-        return "KMD direct" if self.is_raw else "UMD pool"
+    def alloc(self, nbytes: int, fill: bool = False):
+        return self.bk.alloc(nbytes, fill=fill)
 
-    def layer(self) -> "Layer":
-        return Layer(self.bk, self.is_raw)
+    def free(self, t):
+        pass  # tensor dies when the caller drops the reference
+
+    def sync(self):
+        self.bk.synchronize()
+
+    def release(self, ts):
+        ts.clear()
+        gc.collect()
+        self.sync()
+
+    def gauge_mb(self):
+        return self.bk.reserved() / MB
 
     def cold_alloc(self, nbytes: int) -> float:
-        """One cold alloc (ms). Pool mode empties the cache first to force a KMD hit."""
-        if self.is_raw:
-            t0 = time.perf_counter()
-            p = self.bk.raw.alloc(nbytes)
-            dt = (time.perf_counter() - t0) * 1e3
-            self.bk.raw.free(p)
-            return dt
+        """One cold alloc (ms): empty the cache first to force a KMD hit."""
         self.bk.empty_cache()
         t0 = time.perf_counter()
         t = self.bk.alloc(nbytes)
@@ -416,58 +510,78 @@ class AllocStrategy:
         return dt
 
     def hot_alloc_avg(self, nbytes: int, rounds: int) -> float:
-        """Mean hot alloc (ms). Pool mode hits the cache pool; direct mode still hits KMD every call."""
+        """Mean hot alloc (ms): every call is served by the cache pool."""
         times = []
         for _ in range(rounds):
             t0 = time.perf_counter()
-            if self.is_raw:
-                p = self.bk.raw.alloc(nbytes)
-                times.append((time.perf_counter() - t0) * 1e3)
-                self.bk.raw.free(p)
-            else:
-                t = self.bk.alloc(nbytes)
-                times.append((time.perf_counter() - t0) * 1e3)
-                del t
+            t = self.bk.alloc(nbytes)
+            times.append((time.perf_counter() - t0) * 1e3)
+            del t
         return sum(times) / len(times)
 
 
-class Layer:
-    """Uniform alloc/free/sync/gauge over UMD pool (torch tensors) and KMD direct (driver pointers)."""
+class KmdLayer:
+    """KMD direct layer: every alloc/free is a driver call (requires bk.raw).
 
-    def __init__(self, bk: Backend, raw: bool):
-        self.bk, self.raw = bk, raw
+    Gauge is driver free MB (counts down), sync is driver-side, and fill is
+    unsupported (no tensor wraps the raw pointer).
+    """
+
+    layer_name = "KMD direct"
+
+    def __init__(self, bk: Backend):
+        self.bk, self.raw = bk, bk.raw
+
+    @property
+    def name(self):
+        return f"KMD direct ({self.raw.desc})"
 
     def alloc(self, nbytes: int, fill: bool = False):
-        """Raw path returns a driver pointer (fill unsupported); pool path returns a tensor."""
-        return self.bk.raw.alloc(nbytes) if self.raw else self.bk.alloc(nbytes, fill=fill)
+        return self.raw.alloc(nbytes)
 
     def free(self, h):
-        if self.raw:
-            self.bk.raw.free(h)
-        # pool tensors: freed when the caller drops the reference
+        self.raw.free(h)
 
     def sync(self):
-        """Barrier matching the layer: driver sync for raw, torch sync for pool."""
-        if self.raw:
-            self.bk.raw.sync()
-        else:
-            self.bk.synchronize()
+        self.raw.sync()
 
     def release(self, hs):
-        """Drop all handles, then sync (frees driver pointers; pool tensors die with the list)."""
-        if self.raw:
-            for h in hs:
-                self.bk.raw.free(h)
+        for h in hs:
+            self.raw.free(h)
         hs.clear()
-        gc.collect()
         self.sync()
 
     def gauge_mb(self):
-        """UMD layer: reserved MB (counts up). KMD layer: driver free MB (counts down)."""
-        if self.raw:
-            f, _ = self.bk.mem_info()
-            return (f / MB) if f is not None else None
-        return self.bk.reserved() / MB
+        f, _ = self.bk.mem_info()
+        return (f / MB) if f is not None else None
+
+    def cold_alloc(self, nbytes: int) -> float:
+        """One cold alloc (ms): straight into KMD, freed right after."""
+        t0 = time.perf_counter()
+        p = self.raw.alloc(nbytes)
+        dt = (time.perf_counter() - t0) * 1e3
+        self.raw.free(p)
+        return dt
+
+    def hot_alloc_avg(self, nbytes: int, rounds: int) -> float:
+        """Mean hot alloc (ms): KMD is hit on every call, no pool in between."""
+        times = []
+        for _ in range(rounds):
+            t0 = time.perf_counter()
+            p = self.raw.alloc(nbytes)
+            times.append((time.perf_counter() - t0) * 1e3)
+            self.raw.free(p)
+        return sum(times) / len(times)
+
+
+def make_layer(bk: Backend, direct: bool) -> "PoolLayer | KmdLayer":
+    """--direct picks the KMD layer; without a raw driver API it degrades to the pool."""
+    if not direct:
+        return PoolLayer(bk)
+    if bk.raw is not None:
+        return KmdLayer(bk)
+    print(f"  ℹ️ {bk.NAME}: no direct driver API ({bk.raw_err}); --direct degrades to per-alloc empty_cache")
+    return PoolLayer(bk, degraded=True)
 
 
 # ========= Helpers =========
@@ -497,12 +611,13 @@ def write_bandwidth(bk: Backend, nbytes: int) -> float:
     return nbytes / GB / dt
 
 
-def bench_small(L: Layer, n: int = 500, size_mb: int = 1, rounds: int = 3):
+def bench_small(L: "PoolLayer | KmdLayer", n: int = 500, size_mb: int = 1, rounds: int = 3):
     """Block-alloc bench (warm-up + multi-round steady state); returns (ok, steady ms = per-round min, median ms).
 
     Kills two biases: UMD pool cold-vs-warm (warm-up first) and KMD direct first-touch
     page/bookkeeping cost (per-round min). The remaining raw-vs-fragmented gap is page
-    history; test 3's churned-empty control splits it into topology overhead vs history heat.
+    history; the severe-frag test's churned-empty control splits it into topology
+    overhead vs history heat.
     """
     warm = []
     for _ in range(n):
@@ -531,14 +646,14 @@ def bench_small(L: Layer, n: int = 500, size_mb: int = 1, rounds: int = 3):
 
 
 # ========= Test 1: baseline alloc/free performance =========
-def bench_alloc_perf(bk: Backend, strat: AllocStrategy, args):
+def bench_alloc_perf(bk: Backend, L: "PoolLayer | KmdLayer", args):
     rows = []
-    for size_mb in args.sizes:
+    for size_mb in SIZES_MB:
         if size_mb * MB > args.budget * 0.8:
             continue
         nbytes = size_mb * MB
-        cold = strat.cold_alloc(nbytes)
-        hot = strat.hot_alloc_avg(nbytes, args.rounds)
+        cold = L.cold_alloc(nbytes)
+        hot = L.hot_alloc_avg(nbytes, args.rounds)
         bw = write_bandwidth(bk, nbytes)
         rows.append({"size_mb": size_mb, "cold_ms": round(cold, 4), "hot_ms": round(hot, 4), "bw_gbs": round(bw, 1)})
     for r in rows:
@@ -547,14 +662,75 @@ def bench_alloc_perf(bk: Backend, strat: AllocStrategy, args):
         )
     if not rows:
         print("  (sizes exceed budget, nothing measured)")
-    args.report["test1"] = {"layer": strat.name, "rows": rows}
+    args.report["baseline"] = {"layer": L.name, "rows": rows}
 
 
-# ========= Test 2: anti-fragmentation =========
-def test_anti_fragmentation(bk: Backend, strat: AllocStrategy, args):
-    L = strat.layer()
-    rep2 = args.report.setdefault("test2", {"layer": strat.layer_name})
-    seg = min(1024, int(args.budget * 0.5 / MB) // 6 * 6)
+# ========= Test 2: anti-fragmentation (one variant per measurement layer) =========
+def test_anti_fragmentation_pool(bk: Backend, L: PoolLayer, args):
+    """Pool semantics: segment reuse after a whole-segment free (reserved-MB gauge),
+    and reserved growth when a whole-segment request must merge around pinned blocks."""
+    rep = args.report.setdefault("anti_frag", {"layer": L.layer_name})
+    seg = int(args.budget * 0.5 / MB) // 6 * 6
+    if seg < 48:
+        raise RuntimeError("device memory too small for the fragmentation test")
+    blk = seg // 6
+    parts = []
+
+    def flush():
+        for key, msg in parts:
+            print(f"  {key:<7}: {msg}")
+
+    # 1) whole segment in, then out -> the pool keeps the freed segment cached
+    big = L.alloc(seg * MB, fill=True)
+    del big
+    gc.collect()
+    L.sync()
+    g0 = L.gauge_mb()
+
+    # 2) carve 6 blocks: should be served from the cached segment (reuse -> ~0 growth)
+    blocks = [L.alloc(blk * MB, fill=True) for _ in range(6)]
+    growth = L.gauge_mb() - g0
+    parts.append(("carve", f"6x{blk}MB, reserved +{growth:.1f}MB"))
+    rep["segment_reuse_growth_mb"] = round(growth, 1)
+
+    # 3) alternate frees -> 3 holes pinned by live blocks
+    holes = {1, 3, 5}
+    blocks = [t for i, t in enumerate(blocks) if i not in holes]
+    gc.collect()
+    L.sync()
+
+    # 4) 3-block contiguous request: the holes are 1-block each, so a fresh region is
+    #    required (h3 stays alive to pin it through the merge check below)
+    rep["hole3_mb"] = blk * 3
+    h3 = None
+    try:
+        h3 = L.alloc(blk * 3 * MB)
+        parts.append(("hole3", f"{blk * 3}MB ok"))
+        rep["hole3"] = "ok"
+    except Exception as e:
+        if not is_oom(e):
+            raise
+        parts.append(("hole3", f"{blk * 3}MB oom"))
+        rep["hole3"] = "oom"
+
+    # 5) release survivors, then one whole-segment request (merge / reclaim)
+    L.release(blocks)
+    r1 = bk.reserved()
+    merged = L.alloc(seg * MB)
+    growth2 = bk.reserved() / MB - r1
+    parts.append(("merge", f"reserved +{growth2:.1f}MB"))
+    rep["merge_growth_mb"] = round(growth2, 1)
+    del merged
+    del h3
+    bk.empty_cache()
+    flush()
+
+
+def test_anti_fragmentation_kmd(L: KmdLayer, args):
+    """KMD semantics: page-level replan after a whole-segment free, service of a
+    3-block request over non-contiguous holes, and whole-segment reclaim."""
+    rep = args.report.setdefault("anti_frag", {"layer": L.layer_name})
+    seg = int(args.budget * 0.5 / MB) // 6 * 6
     if seg < 48:
         raise RuntimeError("device memory too small for the fragmentation test")
     blk = seg // 6
@@ -565,87 +741,66 @@ def test_anti_fragmentation(bk: Backend, strat: AllocStrategy, args):
             print(f"  {key:<7}: {msg}")
 
     # 1) whole segment in, then out -> one whole free region
-    big = L.alloc(seg * MB, fill=True)
-    if L.raw:
-        L.free(big)
-    else:
-        del big
-        gc.collect()
+    big = L.alloc(seg * MB)
+    L.free(big)
     L.sync()
     g0 = L.gauge_mb()
 
-    # 2) carve 6 blocks in the freed region
-    if L.raw:
-        try:
-            blocks = [L.alloc(blk * MB) for _ in range(6)]
-            g1 = L.gauge_mb()
-            used = (g0 - g1) if (g0 is not None and g1 is not None) else None
-            note = f" (KMD_free -{used:.0f}MB, 6 blocks resident)" if used is not None else ""
-            parts.append(("replan", f"ok{note}"))
-            rep2["replan"] = "ok"
-        except RawOOM as e:
-            parts.append(("replan", f"fail ({e})"))
-            rep2["replan"] = "fail"
-            flush()
-            return
-    else:
-        blocks = [L.alloc(blk * MB, fill=True) for _ in range(6)]
-        growth = L.gauge_mb() - g0
-        parts.append(("carve", f"6x{blk}MB, reserved +{growth:.1f}MB"))
-        rep2["segment_reuse_growth_mb"] = round(growth, 1)
+    # 2) carve 6 blocks in the freed region (KMD replans pages)
+    blocks = []
+    try:
+        for _ in range(6):
+            blocks.append(L.alloc(blk * MB))
+    except RawOOM as e:
+        L.release(blocks)
+        parts.append(("replan", f"fail ({e})"))
+        rep["replan"] = "fail"
+        flush()
+        return
+    g1 = L.gauge_mb()
+    used = (g0 - g1) if (g0 is not None and g1 is not None) else None
+    note = f" ({used:.0f}MB KMD_free consumed, 6 blocks resident)" if used is not None else ""
+    parts.append(("replan", f"ok{note}"))
+    rep["replan"] = "ok"
 
     # 3) alternate frees -> 3 holes pinned by live blocks
     holes = {1, 3, 5}
-    if L.raw:
-        for i in holes:
-            L.free(blocks[i])
-    else:
-        blocks = [t for i, t in enumerate(blocks) if i not in holes]
-        gc.collect()
-        L.sync()
+    for i in holes:
+        L.free(blocks[i])
 
-    # 4) 3-block contiguous request: pool -> pinned holes should OOM; KMD page-level
-    #    scatter usually serves it from non-contiguous pages
-    rep2["hole3_mb"] = blk * 3
+    # 4) 3-block contiguous request: KMD page-level scatter usually serves it
+    #    from non-contiguous pages
+    rep["hole3_mb"] = blk * 3
     try:
         h3 = L.alloc(blk * 3 * MB)
         parts.append(("hole3", f"{blk * 3}MB ok"))
-        rep2["hole3"] = "ok"
+        rep["hole3"] = "ok"
         L.free(h3)
     except Exception as e:
         if not is_oom(e):
             raise
         parts.append(("hole3", f"{blk * 3}MB oom"))
-        rep2["hole3"] = "oom"
+        rep["hole3"] = "oom"
 
-    # 5) return everything, then one whole-segment request (merge / reclaim)
-    if L.raw:
-        for i in (0, 2, 4):
-            L.free(blocks[i])
-        try:
-            p = L.alloc(seg * MB)
-            parts.append(("reclaim", f"{seg}MB ok"))
-            rep2["whole_segment"] = "ok"
-            L.free(p)
-        except RawOOM as e:
-            parts.append(("reclaim", f"{seg}MB fail ({e})"))
-            rep2["whole_segment"] = "oom"
-    else:
-        L.release(blocks)
-        r1 = bk.reserved()
-        merged = L.alloc(seg * MB)
-        growth2 = bk.reserved() / MB - r1
-        parts.append(("merge", f"reserved +{growth2:.1f}MB"))
-        rep2["merge_growth_mb"] = round(growth2, 1)
-        del merged
-        bk.empty_cache()
+    # 5) return everything, then one whole-segment request (reclaim)
+    for i in (0, 2, 4):
+        L.free(blocks[i])
+    try:
+        p = L.alloc(seg * MB)
+        parts.append(("reclaim", f"{seg}MB ok"))
+        rep["whole_segment"] = "ok"
+        L.free(p)
+    except RawOOM as e:
+        parts.append(("reclaim", f"{seg}MB fail ({e})"))
+        rep["whole_segment"] = "oom"
     flush()
 
 
 # ========= Test 3: alloc performance under severe fragmentation =========
-def test_severe_fragmentation(bk: Backend, strat: AllocStrategy, args):
-    L = strat.layer()
-    rep3 = args.report.setdefault("test3", {"layer": strat.layer_name})
+def test_severe_fragmentation(bk: Backend, L: "PoolLayer | KmdLayer", args):
+    """Layer-agnostic: fill to the budget, free a random half, then measure ladder /
+    small-block service; the churned-empty control splits topology vs history heat."""
+    rep = args.report.setdefault("severe_frag", {"layer": L.layer_name})
     rng = random.Random(args.seed)
     bs_n = min(500, max(10, 1600 // args.bench_mb))
 
@@ -653,10 +808,11 @@ def test_severe_fragmentation(bk: Backend, strat: AllocStrategy, args):
     _, steady0, _ = bench_small(L, n=bs_n, size_mb=args.bench_mb)
     bk.empty_cache()
 
-    # Phase 1: random-size fill up to fill-pct of budget
+    # Phase 1: random-size fill up to the budget (OOM ends the fill; --ratio 1.0
+    # consumes all free memory -> real fragmentation with no large contiguous region)
     handles, sizes, t_allocs = [], [], []
-    target, filled = int(args.budget * args.fill_pct), 0
-    while filled < target and len(handles) < 80:
+    target, filled = args.budget, 0
+    while filled < target:
         mb = rng.choice(FILL_SIZES_MB)
         t0 = time.perf_counter()
         try:
@@ -668,23 +824,22 @@ def test_severe_fragmentation(bk: Backend, strat: AllocStrategy, args):
         t_allocs.append(time.perf_counter() - t0)
         sizes.append(mb)
         filled += mb
-    rep3["fill_blocks"] = len(sizes)
-    rep3["fill_mb"] = filled
+    rep["fill_blocks"] = len(sizes)
+    rep["fill_mb"] = filled
     if t_allocs:
-        rep3["fill_alloc_avg_ms"] = round(sum(t_allocs) / len(t_allocs) * 1e3, 4)
-    rep3["plan_fill_sizes"] = sizes
+        rep["fill_alloc_avg_ms"] = round(sum(t_allocs) / len(t_allocs) * 1e3, 4)
+    rep["plan_fill_sizes"] = sizes
 
     # Phase 2: free a random half -> severe fragmentation
     order = list(range(len(handles)))
     rng.shuffle(order)
     to_free = set(order[: len(order) // 2])
     freed_mb = sum(sizes[i] for i in to_free)
+    freed = [h for i, h in enumerate(handles) if i in to_free]
     handles = [h for i, h in enumerate(handles) if i not in to_free]
     sizes = [s for i, s in enumerate(sizes) if i not in to_free]
-    if not L.raw:
-        gc.collect()
-    L.sync()
-    rep3["plan_freed_indices"] = sorted(to_free)
+    L.release(freed)
+    rep["plan_freed_indices"] = sorted(to_free)
 
     # Phase 3: growing contiguous allocs on the fragmented layer
     max_ok, first_fail = 0, None
@@ -702,9 +857,9 @@ def test_severe_fragmentation(bk: Backend, strat: AllocStrategy, args):
 
     # Phase 4: small-block service on the fragmented layer
     ok4, steady4, _ = bench_small(L, n=bs_n, size_mb=args.bench_mb)
-    rep3["small_bench_mb"] = args.bench_mb
-    rep3["small_ok"] = ok4
-    rep3["small_steady_ms"] = round(steady4, 4)
+    rep["small_bench_mb"] = args.bench_mb
+    rep["small_ok"] = ok4
+    rep["small_steady_ms"] = round(steady4, 4)
 
     # Phase 4b: churned-empty control -- release the survivors (page history stays hot,
     # topology returns to contiguous); splits topology overhead vs history heat
@@ -712,10 +867,10 @@ def test_severe_fragmentation(bk: Backend, strat: AllocStrategy, args):
     _, steady5b, _ = bench_small(L, n=bs_n, size_mb=args.bench_mb)
     topo = (steady4 / steady5b) if steady5b else None
     hist = (steady5b / steady0) if steady0 else None
-    rep3["small_steady_ms_pristine"] = round(steady0, 4)
-    rep3["small_steady_ms_churn"] = round(steady5b, 4)
-    rep3["small_frag_overhead"] = round(topo, 2) if topo is not None else None
-    rep3["small_history_ratio"] = round(hist, 2) if hist is not None else None
+    rep["small_steady_ms_pristine"] = round(steady0, 4)
+    rep["small_steady_ms_churn"] = round(steady5b, 4)
+    rep["small_frag_overhead"] = round(topo, 2) if topo is not None else None
+    rep["small_history_ratio"] = round(hist, 2) if hist is not None else None
 
     # Phase 5: recovery -- retry the previously OOM size after cleanup
     recovered = None
@@ -728,12 +883,12 @@ def test_severe_fragmentation(bk: Backend, strat: AllocStrategy, args):
             if not is_oom(e):
                 raise
             recovered = False
-    rep3["recovered"] = recovered
-    rep3["ladder_max_ok_mb"] = max_ok
-    rep3["ladder_first_fail_mb"] = first_fail
+    rep["recovered"] = recovered
+    rep["ladder_max_ok_mb"] = max_ok
+    rep["ladder_first_fail_mb"] = first_fail
 
     ladder_txt = f"{max_ok}MB ok" + (f", OOM from {first_fail}MB" if first_fail else "")
-    print(f"  {'fill':<7}: {rep3['fill_blocks']} blocks / {filled}MB  (freed {len(to_free)} / {freed_mb}MB)")
+    print(f"  {'fill':<7}: {rep['fill_blocks']} blocks / {filled}MB  (freed {len(to_free)} / {freed_mb}MB)")
     print(f"  {'ladder':<7}: {ladder_txt}")
     print(f"  {'small':<7}: {ok4}/{bs_n} blocks @ {args.bench_mb}MB -> {steady4:.4f}ms")
     print(f"  {'verdict':<7}: frag {topo:.2f}x ({steady4:.4f} vs {steady5b:.4f}ms) | history {hist:.2f}x")
@@ -748,11 +903,10 @@ def parse_args():
     p.add_argument("--backend", choices=["auto", "cuda", "hip", "xpu"], default="auto", help="compute backend")
     p.add_argument("--direct", action="store_true", help="bypass the UMD buffer pool, one KMD alloc per call")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--ratio", type=float, default=0.35, help="test budget cap as a fraction of driver free memory")
-    p.add_argument("--max-gb", type=float, default=4.0, help="absolute test budget cap (GB)")
-    p.add_argument("--sizes", default="4,32,128,512", help="test 1 block sizes (MB), comma-separated")
-    p.add_argument("--rounds", type=int, default=20, help="test 1 hot-alloc rounds")
-    p.add_argument("--fill-pct", type=float, default=0.8, help="test 3 fill ratio")
+    p.add_argument(
+        "--ratio", type=float, default=0.35, help="test budget as a fraction of driver free memory; 1.0 fills all free memory"
+    )
+    p.add_argument("--rounds", type=int, default=20, help="baseline hot-alloc rounds")
     p.add_argument("--bench-mb", type=int, default=1, help="small-block bench size (MB): 1=small, 32=mid (exposes frag overhead better)")
     p.add_argument("--json", default=None, help="perf report JSON output path (for A/B comparison)")
     p.add_argument(
@@ -760,9 +914,12 @@ def parse_args():
         action="store_true",
         help="xpu --direct: use Level Zero BIAS_UNCACHED alloc (GPU UC caching, not a pool bypass)",
     )
-    args = p.parse_args()
-    args.sizes = [int(x) for x in str(args.sizes).split(",") if x.strip()]
-    return args
+    p.add_argument(
+        "--contig",
+        action="store_true",
+        help="xpu --direct: KMD allocs via zePhysicalMemCreate (physically contiguous, no page scatter); no-op for cuda/hip",
+    )
+    return p.parse_args()
 
 
 def main():
@@ -779,11 +936,16 @@ def main():
             f"a sandbox may block /dev/dri — run on the host terminal)"
         )
 
-    bk.setup(direct=args.direct)
+    if args.contig and not args.direct:
+        raise SystemExit("❌ --contig requires --direct")
+
+    bk.setup(direct=args.direct, contig=args.contig)
     free, total = bk.mem_info()
-    budget = int(min(args.max_gb * GB, (free or args.max_gb * GB) * args.ratio))
+    budget = int((free or 0) * args.ratio)
+    if budget <= 0:
+        raise SystemExit("❌ no usable budget: driver free memory unknown or 0 (mem_get_info failed)")
     args.budget = budget
-    strat = AllocStrategy(bk, args.direct)
+    L = make_layer(bk, args.direct)
     print("═" * WIDTH)
     print(" GPU Memory Allocator Benchmark")
     print("═" * WIDTH)
@@ -791,25 +953,29 @@ def main():
     print(f"  {'backend':<8}: {bk.NAME} ({bk.device_name()})")
     if free is not None:
         print(f"  {'memory':<8}: {free / GB:.1f} / {total / GB:.1f} GB free")
-    print(f"  {'layer':<8}: {strat.name}")
+    print(f"  {'layer':<8}: {L.name}")
     print(f"  {'budget':<8}: {budget / GB:.2f} GB   seed {args.seed}")
     args.report["meta"] = {
         "torch": torch.__version__,
         "backend": bk.NAME,
         "device": bk.device_name(),
-        "layer": strat.name,
+        "layer": L.name,
         "direct": args.direct,
+        "contig": args.contig,
         "seed": args.seed,
         "budget_gb": round(budget / GB, 2),
         "env": {k: os.environ[k] for k in ENV_KEYS if os.environ.get(k)},
     }
 
     section("Baseline alloc/free")
-    bench_alloc_perf(bk, strat, args)
+    bench_alloc_perf(bk, L, args)
     section("Anti-fragmentation")
-    test_anti_fragmentation(bk, strat, args)
+    if isinstance(L, KmdLayer):
+        test_anti_fragmentation_kmd(L, args)
+    else:
+        test_anti_fragmentation_pool(bk, L, args)
     section("Severe fragmentation")
-    test_severe_fragmentation(bk, strat, args)
+    test_severe_fragmentation(bk, L, args)
 
     bk.empty_cache()
     if args.json:
