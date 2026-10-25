@@ -21,6 +21,10 @@ Measurement layers:
     object per alloc (contiguous physical backing, no page scatter), the
     fragmentation-sensitive mode: scattered free space can no longer serve large
     requests. cuda/hip need no flag (cudaMalloc/hipMalloc are contiguous-demanding).
+  --checkerboard (severe fragmentation): fill with uniform --cell-mb cells (default
+    --bench-mb), then free every other cell -- the free holes are single isolated cells,
+    whose size can be set below the bench request to force a hole/request mismatch
+    (default: random sizes / random half freed).
 
 Usage / A-B (comparison is manual; the script never auto-compares):
   python mem_perf.py --backend xpu
@@ -798,8 +802,9 @@ def test_anti_fragmentation_kmd(L: KmdLayer, args):
 
 # ========= Test 3: alloc performance under severe fragmentation =========
 def test_severe_fragmentation(bk: Backend, L: "PoolLayer | KmdLayer", args):
-    """Layer-agnostic: fill to the budget, free a random half, then measure ladder /
-    small-block service; the churned-empty control splits topology vs history heat."""
+    """Layer-agnostic: fill to the budget, free half, then measure ladder / small-block
+    service; the churned-empty control splits topology vs history heat. --checkerboard
+    swaps the random fill/free for uniform cells with every other one freed."""
     rep = args.report.setdefault("severe_frag", {"layer": L.layer_name})
     rng = random.Random(args.seed)
     bs_n = min(500, max(10, 1600 // args.bench_mb))
@@ -808,12 +813,14 @@ def test_severe_fragmentation(bk: Backend, L: "PoolLayer | KmdLayer", args):
     _, steady0, _ = bench_small(L, n=bs_n, size_mb=args.bench_mb)
     bk.empty_cache()
 
-    # Phase 1: random-size fill up to the budget (OOM ends the fill; --ratio 1.0
-    # consumes all free memory -> real fragmentation with no large contiguous region)
+    # Phase 1: fill up to the budget (OOM ends the fill; --ratio 1.0 consumes all free
+    # memory -> real fragmentation with no large contiguous region). Default: random
+    # sizes; --checkerboard: uniform --cell-mb cells for a regular free pattern.
+    pattern, cell = ("checkerboard" if args.checkerboard else "random"), args.cell_mb or args.bench_mb
     handles, sizes, t_allocs = [], [], []
-    target, filled = args.budget, 0
+    target, filled = args.budget // MB, 0  # budget is bytes; fill bookkeeping is MB
     while filled < target:
-        mb = rng.choice(FILL_SIZES_MB)
+        mb = cell if args.checkerboard else rng.choice(FILL_SIZES_MB)
         t0 = time.perf_counter()
         try:
             handles.append(L.alloc(mb * MB, fill=True))
@@ -829,11 +836,19 @@ def test_severe_fragmentation(bk: Backend, L: "PoolLayer | KmdLayer", args):
     if t_allocs:
         rep["fill_alloc_avg_ms"] = round(sum(t_allocs) / len(t_allocs) * 1e3, 4)
     rep["plan_fill_sizes"] = sizes
+    rep["pattern"] = pattern
+    if args.checkerboard:
+        rep["cell_mb"] = cell
 
-    # Phase 2: free a random half -> severe fragmentation
-    order = list(range(len(handles)))
-    rng.shuffle(order)
-    to_free = set(order[: len(order) // 2])
+    # Phase 2: free half -> severe fragmentation. Default: random half; checkerboard:
+    # every other cell, so each hole is one isolated cell with no two adjacent free.
+    n = len(handles)
+    if args.checkerboard:
+        to_free = set(range(0, n, 2))
+    else:
+        order = list(range(n))
+        rng.shuffle(order)
+        to_free = set(order[: n // 2])
     freed_mb = sum(sizes[i] for i in to_free)
     freed = [h for i, h in enumerate(handles) if i in to_free]
     handles = [h for i, h in enumerate(handles) if i not in to_free]
@@ -888,7 +903,8 @@ def test_severe_fragmentation(bk: Backend, L: "PoolLayer | KmdLayer", args):
     rep["ladder_first_fail_mb"] = first_fail
 
     ladder_txt = f"{max_ok}MB ok" + (f", OOM from {first_fail}MB" if first_fail else "")
-    print(f"  {'fill':<7}: {rep['fill_blocks']} blocks / {filled}MB  (freed {len(to_free)} / {freed_mb}MB)")
+    pat = f", {pattern} cell {cell}MB" if args.checkerboard else ""
+    print(f"  {'fill':<7}: {rep['fill_blocks']} blocks / {filled}MB  (freed {len(to_free)} / {freed_mb}MB{pat})")
     print(f"  {'ladder':<7}: {ladder_txt}")
     print(f"  {'small':<7}: {ok4}/{bs_n} blocks @ {args.bench_mb}MB -> {steady4:.4f}ms")
     print(f"  {'verdict':<7}: frag {topo:.2f}x ({steady4:.4f} vs {steady5b:.4f}ms) | history {hist:.2f}x")
@@ -908,6 +924,17 @@ def parse_args():
     )
     p.add_argument("--rounds", type=int, default=20, help="baseline hot-alloc rounds")
     p.add_argument("--bench-mb", type=int, default=1, help="small-block bench size (MB): 1=small, 32=mid (exposes frag overhead better)")
+    p.add_argument(
+        "--checkerboard",
+        action="store_true",
+        help="severe fragmentation pattern: fill with uniform cells, free every other cell (isolated single-cell holes)",
+    )
+    p.add_argument(
+        "--cell-mb",
+        type=int,
+        default=None,
+        help="--checkerboard cell size (MB); defaults to --bench-mb, set it below --bench-mb for a hole/request mismatch",
+    )
     p.add_argument("--json", default=None, help="perf report JSON output path (for A/B comparison)")
     p.add_argument(
         "--ze-uncached",
@@ -938,6 +965,8 @@ def main():
 
     if args.contig and not args.direct:
         raise SystemExit("❌ --contig requires --direct")
+    if args.cell_mb is not None and not args.checkerboard:
+        raise SystemExit("❌ --cell-mb requires --checkerboard")
 
     bk.setup(direct=args.direct, contig=args.contig)
     free, total = bk.mem_info()
@@ -962,6 +991,8 @@ def main():
         "layer": L.name,
         "direct": args.direct,
         "contig": args.contig,
+        "checkerboard": args.checkerboard,
+        "cell_mb": args.cell_mb,
         "seed": args.seed,
         "budget_gb": round(budget / GB, 2),
         "env": {k: os.environ[k] for k in ENV_KEYS if os.environ.get(k)},
